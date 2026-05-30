@@ -1,6 +1,9 @@
 import numpy as np
 import sys
 
+from numba import jit
+from scipy.special import gammaln
+
 
 def rotate_matrix(cos, sin, axis):
     """
@@ -73,9 +76,12 @@ def rotate_patch(patch, v_start, v_z, pin):
 
     _ESP_ = 1e-10
 
-    patch_trans = patch[:, :3] - pin
+    patch_trans = np.asarray(patch)[:, :3]
+    v_start = np.asarray(v_start).reshape(-1)[:3]
+    pin = np.asarray(pin).reshape(-1)[:3]
+    v_z = np.asarray(v_z).reshape(-1)[0]
 
-    n_points = np.shape(patch_trans)[0]
+    patch_trans = patch_trans - pin
 
     # defining rotating vectors
     r_z = np.array([0, 0, v_z])
@@ -96,8 +102,7 @@ def rotate_patch(patch, v_start, v_z, pin):
 
         r = rotate_matrix(cos_theta, sin_theta, 2)
         if xy:
-            for i in range(n_points):
-                patch_trans[i, :] = np.dot(r, patch_trans[i, :])
+            patch_trans = np.dot(patch_trans, r.T)
             r_vn1 = np.dot(r, r_vn1)
 
         # y-z plane
@@ -114,12 +119,169 @@ def rotate_patch(patch, v_start, v_z, pin):
 
         r = rotate_matrix(cos_theta, sin_theta, 0)
         if yz:
-            for i in range(n_points):
-                patch_trans[i, :] = np.dot(r, patch_trans[i, :])
+            patch_trans = np.dot(patch_trans, r.T)
             r_vn1 = np.dot(r, r_vn1)
 
         p = np.abs(1 - r_z.dot(r_vn1) / np.sqrt((r_z.dot(r_z)) * (r_vn1.dot(r_vn1))))
     return r_vn1, patch_trans
+
+
+@jit(nopython=True)
+def _isolate_surfaces_jit(surface, min_d2):
+    n_points = surface.shape[0]
+    labels = np.zeros(n_points, dtype=np.int8)
+    stack = np.empty(n_points, dtype=np.int64)
+    lab = 2
+
+    for seed in range(n_points):
+        if labels[seed] != 0:
+            continue
+
+        stack_top = 0
+        stack[stack_top] = seed
+        stack_top += 1
+        labels[seed] = lab
+
+        while stack_top > 0:
+            stack_top -= 1
+            i = stack[stack_top]
+
+            for j in range(n_points):
+                if labels[j] == 0:
+                    d2 = (surface[j, 0] - surface[i, 0]) ** 2 + (surface[j, 1] - surface[i, 1]) ** 2 + (surface[j, 2] - surface[i, 2]) ** 2
+                    if d2 < min_d2:
+                        labels[j] = lab
+                        stack[stack_top] = j
+                        stack_top += 1
+
+        lab += 1
+
+    return labels
+
+
+@jit(nopython=True)
+def _contact_points_jit(list_1, list_2, thresh2):
+    l1 = list_1.shape[0]
+    l2 = list_2.shape[0]
+
+    # flags and mins per element to avoid duplicates and extra sorting
+    contact_1_flag = np.zeros(l1, dtype=np.bool_)
+    contact_1_min = np.empty(l1, dtype=np.float64)
+    for i in range(l1):
+        contact_1_min[i] = np.inf
+
+    contact_2_flag = np.zeros(l2, dtype=np.bool_)
+    contact_2_min = np.empty(l2, dtype=np.float64)
+    for j in range(l2):
+        contact_2_min[j] = np.inf
+
+    for i in range(l1):
+        for j in range(l2):
+            d2 = (list_1[i, 0] - list_2[j, 0]) ** 2 + (list_1[i, 1] - list_2[j, 1]) ** 2 + (list_1[i, 2] - list_2[j, 2]) ** 2
+            if d2 < thresh2:
+                contact_1_flag[i] = True
+                if d2 < contact_1_min[i]:
+                    contact_1_min[i] = d2
+                contact_2_flag[j] = True
+                if d2 < contact_2_min[j]:
+                    contact_2_min[j] = d2
+
+    contact_1_count = 0
+    for i in range(l1):
+        if contact_1_flag[i]:
+            contact_1_count += 1
+
+    contact_2_count = 0
+    for j in range(l2):
+        if contact_2_flag[j]:
+            contact_2_count += 1
+
+    contact_1 = np.empty((contact_1_count, 4), dtype=np.float64)
+    contact_2 = np.empty((contact_2_count, 4), dtype=np.float64)
+
+    c1pos = 0
+    for i in range(l1):
+        if contact_1_flag[i]:
+            contact_1[c1pos, 0] = list_1[i, 0]
+            contact_1[c1pos, 1] = list_1[i, 1]
+            contact_1[c1pos, 2] = list_1[i, 2]
+            contact_1[c1pos, 3] = contact_1_min[i]
+            c1pos += 1
+
+    c2pos = 0
+    for j in range(l2):
+        if contact_2_flag[j]:
+            contact_2[c2pos, 0] = list_2[j, 0]
+            contact_2[c2pos, 1] = list_2[j, 1]
+            contact_2[c2pos, 2] = list_2[j, 2]
+            contact_2[c2pos, 3] = contact_2_min[j]
+            c2pos += 1
+
+    return contact_1, contact_2
+
+
+@jit(nopython=True)
+def _contact_points_with_index_jit(list_1, list_2, thresh2):
+    l1 = list_1.shape[0]
+    l2 = list_2.shape[0]
+
+    contact_1_flag = np.zeros(l1, dtype=np.bool_)
+    contact_1_min = np.empty(l1, dtype=np.float64)
+    for i in range(l1):
+        contact_1_min[i] = np.inf
+
+    contact_2_flag = np.zeros(l2, dtype=np.bool_)
+    contact_2_min = np.empty(l2, dtype=np.float64)
+    for j in range(l2):
+        contact_2_min[j] = np.inf
+
+    for i in range(l1):
+        for j in range(l2):
+            d2 = (list_1[i, 0] - list_2[j, 0]) ** 2 + (list_1[i, 1] - list_2[j, 1]) ** 2 + (list_1[i, 2] - list_2[j, 2]) ** 2
+            if d2 < thresh2:
+                contact_1_flag[i] = True
+                if d2 < contact_1_min[i]:
+                    contact_1_min[i] = d2
+                contact_2_flag[j] = True
+                if d2 < contact_2_min[j]:
+                    contact_2_min[j] = d2
+
+    contact_1_count = 0
+    for i in range(l1):
+        if contact_1_flag[i]:
+            contact_1_count += 1
+
+    contact_2_count = 0
+    for j in range(l2):
+        if contact_2_flag[j]:
+            contact_2_count += 1
+
+    contact_1 = np.empty((contact_1_count, 4), dtype=np.float64)
+    contact_2 = np.empty((contact_2_count, 4), dtype=np.float64)
+    list_index_1 = np.empty(contact_1_count, dtype=np.int64)
+    list_index_2 = np.empty(contact_2_count, dtype=np.int64)
+
+    c1pos = 0
+    for i in range(l1):
+        if contact_1_flag[i]:
+            contact_1[c1pos, 0] = list_1[i, 0]
+            contact_1[c1pos, 1] = list_1[i, 1]
+            contact_1[c1pos, 2] = list_1[i, 2]
+            contact_1[c1pos, 3] = contact_1_min[i]
+            list_index_1[c1pos] = i
+            c1pos += 1
+
+    c2pos = 0
+    for j in range(l2):
+        if contact_2_flag[j]:
+            contact_2[c2pos, 0] = list_2[j, 0]
+            contact_2[c2pos, 1] = list_2[j, 1]
+            contact_2[c2pos, 2] = list_2[j, 2]
+            contact_2[c2pos, 3] = contact_2_min[j]
+            list_index_2[c2pos] = j
+            c2pos += 1
+
+    return contact_1, contact_2, list_index_1, list_index_2
 
 
 def flip_matrix(mat, axis):
@@ -200,53 +362,11 @@ def isolate_surfaces(surface, min_d=1.):
     >>> isolate_surfaces(mat, 1)
     array([2, 3, 3, 2, 3], dtype=int8)
     """
-    min_d2 = min_d ** 2  # squaring distance to avoid sqrt
-    l, tmp = np.shape(surface)  # computing number of surface points
+    surface = np.asarray(surface)
+    if surface.shape[1] > 3:
+        surface = surface[:, :3]
 
-    # initializing label vectors
-    surf_label = np.ones(l, dtype=np.int8)
-    surf_tmp = np.ones(l, dtype=np.int8)
-
-    lab = 2  # starting from label = 2
-    n_left = np.sum(surf_tmp != 0)  # computing number of points without label
-
-    # starting iterating over different surfaces
-    while n_left > 0:
-        count = 1
-        pos__ = np.where(surf_tmp != 0)
-
-        # seeding: first unlabeled point takes lab label
-        surf_label[pos__[0][0]] = lab
-        surf_tmp[pos__[0][0]] = lab
-
-        # iterating to find points belonging to the same surface
-        while count > 0:
-            count = 0
-            pos_s = np.where(surf_tmp == lab)
-            # creating mask for points still to be processed
-            mask = np.logical_and(surf_tmp > 0, surf_tmp != lab)
-
-            for i in pos_s[0]:
-                # computing distances between points and the i-th point
-                d = (surface[:, 0] - surface[i, 0]) ** 2 + (surface[:, 1] - surface[i, 1]) ** 2 + (
-                            surface[:, 2] - surface[i, 2]) ** 2
-
-                m_np = d < min_d2  # m_np: mask near points
-                surf_tmp[i] = 0  # removing processed point from system
-                m_proc = np.logical_and(m_np, mask)  # m_proc: mask for point still to be processed
-
-                tot_to_proc = np.sum(m_proc)
-
-                if tot_to_proc > 0:
-                    surf_label[m_proc] = lab
-                    surf_tmp[m_proc] = lab
-                    count += 1
-                mask = np.logical_and(surf_tmp > 0, surf_tmp != lab)
-
-        lab += 1  # creating a new label
-        n_left = np.sum(surf_tmp != 0)  # looking for how many points still to be processed
-
-    return surf_label
+    return _isolate_surfaces_jit(surface, min_d ** 2)
 
 
 def _find_border(new_plane_ab):
@@ -313,50 +433,24 @@ def contact_points(list_1, list_2, thresh):
         - the points in ``list_1`` in contact with ``list_2`` (`ndarray`)
         - the points in ``list_2`` in contact with ``list_1`` (`ndarray`)
     """
+    list_1 = np.asarray(list_1)
+    list_2 = np.asarray(list_2)
+    if list_1.shape[1] > 3:
+        list_1 = list_1[:, :3]
+    if list_2.shape[1] > 3:
+        list_2 = list_2[:, :3]
 
-    thresh2 = thresh ** 2
-    contact_1 = np.array([[0, 0, 0, 0]])
-    contact_2 = np.array([[0, 0, 0]])
-    l1 = np.shape(list_1)[0]
-    # l2 = np.shape(list_2)[0]
+    contact_1, contact_2 = _contact_points_jit(list_1, list_2, thresh ** 2)
+    # `_contact_points_jit` already returns unique `contact_2` rows with
+    # the minimum squared distance in column 3. Just ensure empty shape when no hits.
+    if contact_2.shape[0] == 0:
+        contact_2 = np.empty((0, 4), dtype=np.float64)
+    else:
+        # sort lexicographically by x,y,z to reproduce np.unique(..., axis=0) ordering
+        order = np.lexsort((contact_2[:, 2], contact_2[:, 1], contact_2[:, 0]))
+        contact_2 = contact_2[order]
 
-    mmm = np.zeros(4)
-
-    for i in range(l1):
-        if i % 1000 == 0:
-            sys.stderr.write("\rProgress %d / %d" % (i, l1))
-        d2 = (list_1[i, 0] - list_2[:, 0])**2 + (list_1[i, 1] - list_2[:, 1])**2 + (
-                    list_1[i, 2] - list_2[:, 2])**2
-        mask = d2 < thresh2
-
-        if np.sum(mask) > 0:
-            mmm[:3] = list_1[i, :3]
-            mmm[3] = np.min(d2[mask])
-
-            contact_1 = np.row_stack([contact_1, mmm])
-            contact_2 = np.row_stack([contact_2, list_2[mask, :3]])
-
-    try:
-        contact_2 = np.unique(contact_2, axis=0)
-    except:
-        aaa = contact_2.tolist()
-        output = [0, 0, 0]
-        for x in aaa:
-            if x not in output:
-                output = np.row_stack([output, x])
-        contact_2 = output.copy()
-
-    l1 = np.shape(contact_2)[0]
-    mmm = []
-    for i in range(l1):
-        if i % 1000 == 0:
-            sys.stderr.write("\rProgress %d / %d" % (i, l1))
-        d2 = (list_1[:, 0] - contact_2[i, 0])**2 + (list_1[:, 1] - contact_2[i, 1])**2 + (
-                    list_1[:, 2] - contact_2[i, 2])**2
-        mmm.append(np.min(d2))
-    contact_2 = np.column_stack([contact_2, np.array(mmm)])
-
-    return contact_1[1:, :], contact_2[1:, :]
+    return contact_1, contact_2
 
 
 def _contact_points(list_1, list_2, thresh):
@@ -385,60 +479,28 @@ def _contact_points(list_1, list_2, thresh):
         - the indexes of the points in ``list_1`` in contact with ``list_2`` (`ndarray`)
         - the indexes of the points in ``list_2`` in contact with ``list_1`` (`ndarray`)
     """
-    thresh2 = thresh ** 2
-    contact_1 = [0, 0, 0, 0]
-    contact_2 = [0, 0, 0]
-    l1 = np.shape(list_1)[0]
-    l2 = np.shape(list_2)[0]
+    list_1 = np.asarray(list_1)
+    list_2 = np.asarray(list_2)
+    if list_1.shape[1] > 3:
+        list_1 = list_1[:, :3]
+    if list_2.shape[1] > 3:
+        list_2 = list_2[:, :3]
 
-    list_index_1 = []
-    list_index_2 = []
+    contact_1, contact_2, list_index_1, list_index_2 = _contact_points_with_index_jit(list_1, list_2, thresh ** 2)
+    # `_contact_points_with_index_jit` returns unique index arrays and
+    # `contact_2` already contains min squared distances in column 3.
+    if contact_2.shape[0] == 0:
+        contact_2 = np.empty((0, 4), dtype=np.float64)
+    else:
+        # match previous behavior: unique(contact_2, axis=0) sorts lexicographically
+        order = np.lexsort((contact_2[:, 2], contact_2[:, 1], contact_2[:, 0]))
+        contact_2 = contact_2[order]
 
-    indexes_l1 = np.arange(l1)
-    indexes_l2 = np.arange(l2)
+    # previous code did `list_index_2 = np.unique(list_index_2)` which returns sorted indices
+    if list_index_2.shape[0] > 0:
+        list_index_2 = np.sort(list_index_2)
 
-    mmm = np.zeros(4)
-
-    for i in range(l1):
-        if i % 1000 == 0:
-            sys.stderr.write("\rProgress %d / %d" % (i, l1))
-        d2 = (list_1[i, 0] - list_2[:, 0]) ** 2 + (list_1[i, 1] - list_2[:, 1]) ** 2 + (
-                    list_1[i, 2] - list_2[:, 2]) ** 2
-        mask = d2 < thresh2
-
-        if np.sum(mask) > 0:
-            mmm[:3] = list_1[i, :3]
-            mmm[3] = np.min(d2[mask])
-
-            list_index_1 = np.concatenate([list_index_1, [i]])
-            list_index_2 = np.concatenate([list_index_2, indexes_l2[mask]])
-
-            contact_1 = np.row_stack([contact_1, mmm])
-            contact_2 = np.row_stack([contact_2, list_2[mask, :3]])
-
-    list_index_2 = np.unique(list_index_2)
-
-    try:
-        contact_2 = np.unique(contact_2, axis=0)
-    except:
-        aaa = contact_2.tolist()
-        output = [0, 0, 0]
-        for x in aaa:
-            if x not in output:
-                output = np.row_stack([output, x])
-        contact_2 = output.copy()
-
-    l1 = np.shape(contact_2)[0]
-    mmm = []
-    for i in range(l1):
-        if i % 1000 == 0:
-            sys.stderr.write("\rProgress %d / %d" % (i, l1))
-        d2 = (list_1[:, 0] - contact_2[i, 0]) ** 2 + (list_1[:, 1] - contact_2[i, 1]) ** 2 + (
-                    list_1[:, 2] - contact_2[i, 2]) ** 2
-        mmm.append(np.min(d2))
-    contact_2 = np.column_stack([contact_2, np.array(mmm)])
-
-    return contact_1[1:, :], contact_2[1:, :], list_index_1, list_index_2
+    return contact_1, contact_2, list_index_1, list_index_2
 
 
 def _build_cone(z_max, n_disk):
@@ -674,7 +736,11 @@ def log10_factorial(n):
     >>> log10_factorial(10)
     6.559763032876794
     """
-    if n <= 1:
-        return 0
-    else:
-        return np.log10(n) + log10_factorial(n - 1)
+    n = np.asarray(n)
+    output = np.zeros_like(n, dtype=np.float64)
+    mask = n > 1
+    if np.any(mask):
+        output[mask] = gammaln(n[mask] + 1) / np.log(10)
+    if output.ndim == 0:
+        return output.item()
+    return output
