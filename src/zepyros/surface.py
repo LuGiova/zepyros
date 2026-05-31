@@ -4,9 +4,164 @@ import numpy as np
 # import pandas as pd
 import matplotlib.pyplot as mpl
 # from scipy.spatial import distance_matrix
-from zepyros.common import isolate_surfaces, flip_matrix, rotate_patch
+from numba import jit
+from scipy.stats import binned_statistic_2d
+from zepyros.common import isolate_surfaces, rotate_patch
 
 DEB_FIND_ORIENT = 0
+
+
+@jit(nopython=True, cache=True)
+def _fill_inner_gap_jit(plane, r_mat, r2):
+    xl, yl = plane.shape
+    offsets = np.array([-1, 0, 1])
+    nx_offsets = np.array([-1, -1, -1, 0, 0, 0, 1, 1, 1])
+    ny_offsets = np.array([-1, 0, 1, -1, 0, 1, -1, 0, 1])
+    plane_bin = plane.copy()
+    for x in range(xl):
+        for y in range(yl):
+            if plane_bin[x, y] != 0.0:
+                plane_bin[x, y] = 1.0
+
+    list_x, list_y = np.where(plane == 0)
+    l_x = len(list_x)
+    l_x_old = 2 * l_x
+
+    while l_x < l_x_old:
+        for i in range(l_x):
+            x = list_x[i]
+            y = list_y[i]
+
+            if r_mat[x, y] < r2:
+                count = 0.0
+                total = 0.0
+
+                for k in range(9):
+                    xx = x + nx_offsets[k]
+                    yy = y + ny_offsets[k]
+                    if 0 <= xx < xl and 0 <= yy < yl:
+                        value = plane_bin[xx, yy]
+                        count += value
+                        if value != 0.0:
+                            total += plane[xx, yy]
+
+                if count >= 6.0:
+                    neighbor_count = 0.0
+                    neighbor_total = 0.0
+                    for k in range(9):
+                        xx = x + nx_offsets[k]
+                        yy = y + ny_offsets[k]
+                        if 0 <= xx < xl and 0 <= yy < yl:
+                            value = plane[xx, yy]
+                            if value > 0.0:
+                                neighbor_total += value
+                                neighbor_count += 1.0
+                    if neighbor_count > 0.0:
+                        plane[x, y] = neighbor_total / neighbor_count
+
+        list_x, list_y = np.where(plane == 0)
+        l_x_old = l_x
+        l_x = len(list_x)
+
+        plane_bin = plane.copy()
+        for x in range(xl):
+            for y in range(yl):
+                if plane_bin[x, y] != 0.0:
+                    plane_bin[x, y] = 1.0
+
+        if l_x == 0:
+            break
+
+    return plane
+
+
+@jit(nopython=True, cache=True)
+def _fill_gap_everywhere_jit(plane, r_mat, r2):
+    xl, yl = plane.shape
+
+    list_x, list_y = np.where(plane == 0)
+    count = 0
+
+    while len(list_x) != 0 and count < 50:
+        list_x, list_y = np.where(plane == 0)
+
+        for i in range(len(list_x)):
+            x = list_x[i]
+            y = list_y[i]
+
+            if r_mat[x, y] < r2:
+                if (
+                    (plane[x + 1, y] != 0.0 and plane[x - 1, y] != 0.0) or
+                    (plane[x, y + 1] != 0.0 and plane[x, y - 1] != 0.0)
+                ):
+                    total = 0.0
+                    count_neighbors = 0.0
+                    for dx in range(-1, 2):
+                        for dy in range(-1, 2):
+                            value = plane[x + dx, y + dy]
+                            if value != 0.0:
+                                total += value
+                                count_neighbors += 1.0
+                    if count_neighbors > 0.0:
+                        plane[x, y] = total / count_neighbors
+
+        list_x, list_y = np.where(plane == 0)
+
+        for i in range(len(list_x)):
+            x = list_x[i]
+            y = list_y[i]
+
+            if r_mat[x, y] < r2:
+                if (
+                    (plane[x + 1, y + 1] != 0.0 and plane[x - 1, y - 1] != 0.0) or
+                    (plane[x - 1, y + 1] != 0.0 and plane[x + 1, y - 1] != 0.0)
+                ):
+                    total = 0.0
+                    count_neighbors = 0.0
+                    for dx in range(-1, 2):
+                        for dy in range(-1, 2):
+                            value = plane[x + dx, y + dy]
+                            if value != 0.0:
+                                total += value
+                                count_neighbors += 1.0
+                    if count_neighbors > 0.0:
+                        plane[x, y] = total / count_neighbors
+
+        count += 1
+
+    list_x, list_y = np.where((plane == 0) & (r_mat < r2))
+    count = 0
+
+    while len(list_x) != 0 and count < 50:
+        list_x, list_y = np.where(plane == 0)
+
+        for i in range(len(list_x)):
+            x = list_x[i]
+            y = list_y[i]
+
+            if r_mat[x, y] < r2:
+                total = 0.0
+                count_neighbors = 0.0
+                for dx in range(-1, 2):
+                    for dy in range(-1, 2):
+                        value = plane[x + dx, y + dy]
+                        if value != 0.0:
+                            total += value
+                            count_neighbors += 1
+
+                if count_neighbors == 0.0:
+                    count_neighbors = 1.0
+
+                plane[x, y] = total / count_neighbors
+
+        count += 1
+
+    for x in range(xl):
+        for y in range(yl):
+            if r_mat[x, y] > r2:
+                plane[x, y] = 0.0
+
+    return plane
 
 
 class Surface:
@@ -209,56 +364,49 @@ class Surface:
     def create_plane(self, patch, z_c, n_p=20):
         # TODO: add documentation
         _, lc = np.shape(patch)
-        
-        rot_p = patch.copy()
 
-        # computing geometrical center
-        cm = np.mean(rot_p[:, :3], axis=0)  # TODO: unused. Remove?
+        x = patch[:, 0]
+        y = patch[:, 1]
+        z = patch[:, 2] - z_c
 
-        # shifting patch to have the cone origin in [0,0,0]
-        rot_p[:, 2] -= z_c
+        weights = np.sqrt(x**2 + y**2 + z**2)
+        thetas = np.arctan2(y, x)
+        dist_plane = np.sqrt(x**2 + y**2)
 
-        # computing distances between points and the origin
-        weights = np.sqrt(rot_p[:, 0]**2 + rot_p[:, 1]**2 + rot_p[:, 2]**2)
+        r = np.max(dist_plane) * 1.01
 
-        # computing angles
-        thetas = np.arctan2(rot_p[:, 1], rot_p[:, 0])
+        x_binned = x + r
+        y_binned = r - y
 
-        # computing distances in plane
-        dist_plane = np.sqrt(rot_p[:, 0]**2 + rot_p[:, 1]**2)
+        x_edges = np.linspace(0.0, 2.0 * r, n_p + 1)
+        y_edges = np.linspace(-2.0 * r, 0.0, n_p + 1)
 
-        # computing the circle radius as the maximum distant point..
-        r = np.max(dist_plane)*1.01
+        plane_w = binned_statistic_2d(
+            x_binned,
+            y_binned,
+            weights,
+            statistic='mean',
+            bins=[n_p, n_p],
+            range=[[0.0, 2.0 * r], [0.0, 2.0 * r]],
+        )[0].T
+        plane_w[np.isnan(plane_w)] = 0.0
 
-        # creating plane matrix
         if lc == 3:
-            plane = np.zeros((n_p, n_p))
+            plane = plane_w
         else:
-            plane = np.zeros((n_p, n_p), dtype=np.complex)
-        # adapting points to pixels
-        rot_p[:, 0] += r
-        rot_p[:, 1] -= r
+            plane_el = binned_statistic_2d(
+                x_binned,
+                y_binned,
+                patch[:, 3],
+                statistic='mean',
+                bins=[n_p, n_p],
+                range=[[0.0, 2.0 * r], [0.0, 2.0 * r]],
+            )[0].T
+            plane_el[np.isnan(plane_el)] = 0.0
 
-        pos_plane = rot_p[:, :2]    # np.abs(rot_p[:,:2])
-
-        dr = 2.*r/n_p
-        rr_x = 0
-        rr_y = 0
-        for i in range(n_p):
-            rr_y = 0
-            for j in range(n_p):
-                mask_x = np.logical_and(pos_plane[:, 0] > rr_x, pos_plane[:, 0] <= rr_x + dr)
-                mask_y = np.logical_and(pos_plane[:, 1] < -rr_y, pos_plane[:, 1] >= -(rr_y + dr))
-                mask = np.logical_and(mask_x, mask_y)
-                if len(weights[mask]) > 0:
-                    w = np.mean(weights[mask])
-                    if lc == 3:
-                        plane[j, i] = w
-                    else:
-                        w_el = np.mean(patch[mask, 3])
-                        plane[j, i] = w + 1j*w_el
-                rr_y += dr
-            rr_x += dr
+            plane = np.zeros((n_p, n_p), dtype=np.complex128)
+            plane.real = plane_w
+            plane.imag = plane_el
 
         return plane, weights, dist_plane, thetas
 
@@ -332,65 +480,14 @@ class Surface:
         Output:
         - Filled plane
         """
-
-        # copying plane..
         plane = plane_.copy()
 
-        plane_bin = np.copy(plane)
-        plane_bin[plane_bin != 0] = 1.
-
-        # finding dimensions..
         xl, yl = np.shape(plane)
-
-        # defining radius
-        r = int((xl-1)/2.)
-
-        # defining radial
-        x, y = np.meshgrid(np.arange(-r, r+1), np.arange(-r, r+1))
-        # r_mat = x**2 + np.flip(y, axis=0)**2
-        r_mat = x**2 + flip_matrix(y, axis=0)**2
+        r = int((xl - 1) / 2.)
+        coords = np.arange(-r, r + 1)
+        r_mat = coords[:, None]**2 + coords[::-1][None, :]**2
         r2 = r**2
-
-        # defining mask
-        tmp = np.zeros((3, 3))
-        tmp[1, 1] = 1
-        x_, y_ = np.where(tmp == 0)
-        x_ -= 1
-        y_ -= 1
-
-        list_x, list_y = np.where(plane == 0)
-        l_x = len(list_x)
-        l_x_old = 2*l_x
-        count = 0
-
-        while l_x < l_x_old:
-            for i in range(l_x):
-                x = list_x[i]
-                y = list_y[i]
-
-                if r_mat[x, y] < r2:
-                    xx = x_ + x
-                    yy = y_ + y
-                    mask_x = np.logical_and(xx >= 0, xx < xl)
-                    mask_y = np.logical_and(yy >= 0, yy < yl)
-                    mask = np.logical_and(mask_x, mask_y)
-                    xx = xx[mask]
-                    yy = yy[mask]
-                    tmp = plane_bin[xx, yy]
-                    count = np.sum(tmp)
-                    if count >= 6:
-                        tmp = plane[xx, yy]
-                        l__ = np.sum(tmp > 0)
-                        tmp = np.sum(tmp)/l__
-                        plane[x, y] = tmp
-
-            list_x, list_y = np.where(plane == 0)
-            l_x_old = l_x
-            l_x = len(list_x)
-            plane_bin = np.copy(plane)
-            plane_bin[plane_bin != 0] = 1.
-
-        return plane
+        return _fill_inner_gap_jit(plane, r_mat, r2)
 
     def fill_gap_everywhere(self, plane_):
         """
@@ -402,90 +499,15 @@ class Surface:
         Output:
         - Filled plane
         """
-        # TODO: improve documentation. Maybe staticmethod?
         plane = plane_.copy()
 
         xl, yl = np.shape(plane)
 
-        r = int((xl-1)/2.)
-
-        x, y = np.meshgrid(np.arange(-r, r+1), np.arange(-r, r+1))
-        r_mat = x**2 + flip_matrix(y, axis=0)**2
+        r = int((xl - 1) / 2.)
+        coords = np.arange(-r, r + 1)
+        r_mat = coords[:, None]**2 + coords[::-1][None, :]**2
         r2 = r**2
-
-        tmp = np.zeros((3, 3))
-        x_, y_ = np.where(tmp == 0)
-        x_ -= 1
-        y_ -= 1
-
-        list_x, list_y = np.where(plane == 0)
-
-        count = 0
-
-        while len(list_x) != 0 and count < 50:
-
-            list_x, list_y = np.where(plane == 0)
-
-            for i in range(len(list_x)):
-                x = list_x[i]
-                y = list_y[i]
-
-                if r_mat[x, y] < r2:
-                    if (
-                        (plane[x+1, y] != 0 and plane[x-1, y] != 0) or
-                        (plane[x, y+1] != 0 and plane[x, y-1] != 0)
-                    ):
-                        tmp = plane[x_ + x, y_ + y]
-
-                        l__ = np.sum(tmp != 0)
-                        tmp = np.sum(tmp)/l__
-                        plane[x, y] = tmp
-
-            list_x, list_y = np.where(plane == 0)
-
-            for i in range(len(list_x)):
-                x = list_x[i]
-                y = list_y[i]
-
-                if r_mat[x, y] < r2:
-                    if(
-                        (plane[x+1, y+1] != 0 and plane[x-1, y-1] != 0) or
-                        (plane[x-1, y+1] != 0 and plane[x+1, y-1] != 0)
-                    ):
-                        tmp = plane[x_ + x, y_ + y]
-
-                        l__ = np.sum(tmp != 0)
-                        tmp = np.sum(tmp)/l__
-                        plane[x, y] = tmp
-            count += 1
-
-        # final cycle
-        list_x, list_y = np.where(np.logical_and(plane == 0, r_mat < r2))
-
-        count = 0
-
-        while len(list_x) != 0 and count < 50:
-
-            list_x, list_y = np.where(plane == 0)
-
-            for i in range(len(list_x)):
-                x = list_x[i]
-                y = list_y[i]
-
-                if r_mat[x, y] < r2:
-
-                    tmp = plane[x_ + x, y_ + y]
-
-                    l__ = np.sum(tmp != 0)
-                    if l__ == 0:
-                        l__ = 1
-                    tmp = np.sum(tmp)/l__
-                    plane[x, y] = tmp
-            count += 1
-
-        plane[r_mat > r2] = 0
-
-        return plane
+        return _fill_gap_everywhere_jit(plane, r_mat, r2)
 
     def patch_reorient(self, patch_points, verso):
         # TODO: add documentation. Maybe staticmethod?
