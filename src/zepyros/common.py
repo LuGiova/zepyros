@@ -441,14 +441,10 @@ def contact_points(list_1, list_2, thresh):
         list_2 = list_2[:, :3]
 
     contact_1, contact_2 = _contact_points_jit(list_1, list_2, thresh ** 2)
-    # `_contact_points_jit` already returns unique `contact_2` rows with
-    # the minimum squared distance in column 3. Just ensure empty shape when no hits.
     if contact_2.shape[0] == 0:
         contact_2 = np.empty((0, 4), dtype=np.float64)
     else:
-        # sort lexicographically by x,y,z to reproduce np.unique(..., axis=0) ordering
-        order = np.lexsort((contact_2[:, 2], contact_2[:, 1], contact_2[:, 0]))
-        contact_2 = contact_2[order]
+        contact_2 = np.unique(np.vstack((np.zeros((1, 4)), contact_2)), axis=0)[1:, :]
 
     return contact_1, contact_2
 
@@ -487,18 +483,13 @@ def _contact_points(list_1, list_2, thresh):
         list_2 = list_2[:, :3]
 
     contact_1, contact_2, list_index_1, list_index_2 = _contact_points_with_index_jit(list_1, list_2, thresh ** 2)
-    # `_contact_points_with_index_jit` returns unique index arrays and
-    # `contact_2` already contains min squared distances in column 3.
     if contact_2.shape[0] == 0:
         contact_2 = np.empty((0, 4), dtype=np.float64)
     else:
-        # match previous behavior: unique(contact_2, axis=0) sorts lexicographically
-        order = np.lexsort((contact_2[:, 2], contact_2[:, 1], contact_2[:, 0]))
-        contact_2 = contact_2[order]
+        contact_2 = np.unique(np.vstack((np.zeros((1, 4)), contact_2)), axis=0)[1:, :]
 
-    # previous code did `list_index_2 = np.unique(list_index_2)` which returns sorted indices
     if list_index_2.shape[0] > 0:
-        list_index_2 = np.sort(list_index_2)
+        list_index_2 = np.unique(list_index_2)
 
     return contact_1, contact_2, list_index_1, list_index_2
 

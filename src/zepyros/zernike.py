@@ -426,6 +426,9 @@ class Zernike2D:
         plane_x = np.zeros((n, n))
         plane_y = np.zeros((n, n))
 
+        if n <= 1:
+            return plane_x, plane_y
+
         n_r = int((n-1)/2.)
         dx = 1./n_r
         x = np.arange(0, n)*dx - 1.

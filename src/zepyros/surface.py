@@ -363,6 +363,19 @@ class Surface:
 
     def create_plane(self, patch, z_c, n_p=20):
         # TODO: add documentation
+        patch = np.asarray(patch)
+        if patch.ndim == 1:
+            patch = patch.reshape(1, -1)
+
+        if patch.size == 0 or patch.shape[0] == 0:
+            lc = patch.shape[1] if patch.ndim > 1 and patch.shape[1] != 0 else 3
+            if lc == 3:
+                plane = np.zeros((n_p, n_p))
+            else:
+                plane = np.zeros((n_p, n_p), dtype=np.complex128)
+            empty = np.empty(0, dtype=float)
+            return plane, empty, empty, empty
+
         _, lc = np.shape(patch)
 
         x = patch[:, 0]
