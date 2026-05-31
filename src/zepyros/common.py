@@ -126,7 +126,7 @@ def rotate_patch(patch, v_start, v_z, pin):
     return r_vn1, patch_trans
 
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def _isolate_surfaces_jit(surface, min_d2):
     n_points = surface.shape[0]
     labels = np.zeros(n_points, dtype=np.int8)
@@ -159,7 +159,7 @@ def _isolate_surfaces_jit(surface, min_d2):
     return labels
 
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def _contact_points_jit(list_1, list_2, thresh2):
     l1 = list_1.shape[0]
     l2 = list_2.shape[0]
@@ -220,7 +220,7 @@ def _contact_points_jit(list_1, list_2, thresh2):
     return contact_1, contact_2
 
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def _contact_points_with_index_jit(list_1, list_2, thresh2):
     l1 = list_1.shape[0]
     l2 = list_2.shape[0]
