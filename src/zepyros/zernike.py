@@ -119,8 +119,12 @@ class Zernike3D:
         """
         tmp = 0
         k = int(0.5*(n-l))
+        r2 = self.r**2
+        r_pow = np.ones_like(self.r)
         for v in range(k+1):
-            tmp += self.q_klv(k, l, v)*self.r**(2*v)
+            if v > 0:
+                r_pow *= r2
+            tmp += self.q_klv(k, l, v)*r_pow
         
         return tmp
 
@@ -312,6 +316,7 @@ class Zernike2D:
         self.n_l = n_l
         self.x, self.y = self.build_plane(n_l)
         self.r, self.t = self.from_cartesian_to_polar_plane(self.x, self.y)
+        self._circle_mask = self._build_circle_mask(n_l)
 
         tmp = np.ones(np.shape(self.img))
         tmp = self.circle_image(tmp)
@@ -321,20 +326,13 @@ class Zernike2D:
 
     def circle_image(self, image):
         # TODO: add documentation. Maybe staticmethod?
-        l, tmp = np.shape(image)
-        new_image = image.copy()
+        return np.asarray(image) * self._circle_mask
 
+    def _build_circle_mask(self, l):
         r = ((l - 1)/2.)
         r2 = r**2
-        origin = np.array([r + 1, r + 1])
-
-        for i in range(l):
-            for j in range(i, l):
-                d2 = (i - r)**2 + (j - r)**2
-                if d2 > r2:
-                    new_image[i, j] = 0
-                    new_image[j, i] = 0
-        return new_image
+        rows, cols = np.ogrid[:l, :l]
+        return ((rows - r)**2 + (cols - r)**2 <= r2).astype(float)
 
     def prepare_image(self, datafile):
         data = imread(datafile)
@@ -360,12 +358,9 @@ class Zernike2D:
             new_image[:, :] = data[:l, :l]
 
         if cut:
-            for i in range(l):
-                for j in range(i, l):
-                    d2 = (i - r)**2 + (j - r)**2
-                    if d2 > r2:
-                        new_image[i, j] = 0
-                        new_image[j, i] = 0
+            rows, cols = np.ogrid[:l, :l]
+            mask = ((rows - r)**2 + (cols - r)**2 <= r2).astype(float)
+            new_image *= mask
         return new_image
 
     def compute_dot(self, mat_a, mat_b):
@@ -387,41 +382,13 @@ class Zernike2D:
         return x, y
 
     def from_cartesian_to_polar_plane(self, x, y):
-        l, tmp = np.shape(x)
-        r_ = np.zeros((l, l))
-        theta_ = np.zeros((l, l))
-
-        for i in range(l):
-            for j in range(l):
-                r, t = self._from_cartesian_to_polar(x[i, j], y[i, j])
-                r_[i, j] = r
-                theta_[i, j] = t
-        return r_, theta_
+        return self._from_cartesian_to_polar(x, y)
 
     @staticmethod
     def _from_cartesian_to_polar(x, y):
         r = np.sqrt(x**2 + y**2)
-
-        if y == 0 and x > 0:
-            theta = 0
-        elif y == 0 and x < 0:
-            theta = np.pi
-        else:
-            t = np.arctan(np.abs(y/x))
-            if x > 0 and y > 0:
-                theta = t
-            elif x < 0 and y < 0:
-                theta = t + np.pi
-            elif x < 0 < y:   # elif x < 0 and y > 0:
-                theta = np.pi - t
-            elif y < 0 < x:   # elif x > 0 and y < 0:
-                theta = 2*np.pi - t
-            elif x == 0 and y > 0:
-                theta = np.pi/2.
-            elif x == 0 and y < 0:
-                theta = 3.*np.pi/2.
-            else:
-                theta = 0.
+        theta = np.arctan2(y, x)
+        theta = np.where(theta < 0, theta + 2*np.pi, theta)
         return r, theta
 
     def r_nm(self, n, m, l_r):
@@ -459,6 +426,9 @@ class Zernike2D:
         plane_x = np.zeros((n, n))
         plane_y = np.zeros((n, n))
 
+        if n <= 1:
+            return plane_x, plane_y
+
         n_r = int((n-1)/2.)
         dx = 1./n_r
         x = np.arange(0, n)*dx - 1.
@@ -495,7 +465,7 @@ class Zernike2D:
             z_nm = r_part*self.phi_m(self.t, m)
 
             z_nm[np.isnan(z_nm)] = 0
-            z_nm_ = self.circle_image(z_nm)     # normalization factor.. #*np.sqrt((n+1))
+            z_nm_ = z_nm * self._circle_mask     # normalization factor.. #*np.sqrt((n+1))
             
             self.zernike_dict[(n, m)] = z_nm_
             return z_nm_
